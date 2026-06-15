@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 
-// ─── Step labels shown in the UI ───────────────────────
 const STEPS = [
   "Initializing deployment",
   "Launching cloud instance",
@@ -9,28 +8,12 @@ const STEPS = [
   "Starting container",
 ];
 
-// ─── Log lines per step [command, result] ──────────────
-function getStepLogs(repo) {
-  return [
-    [`POST /deploy  { repo_url: "github.com/${repo}" }`, "Lambda invoked · deployment ID assigned"],
-    ["aws ec2 run-instances --instance-type t2.micro",   "Instance running · public IP assigned ✓"],
-    [`git clone https://github.com/${repo}`,             "Receiving objects: 100% · done ✓"],
-    ["docker build -t app .",                            "Successfully built image ✓"],
-    ["docker run -d -p 3000:3000 app",                   "Container started · health check 200 OK ✓"],
-  ];
-}
-
-// ─── How long each step takes (ms) ────────────────────
 const DELAYS = [1000, 2200, 1800, 3000, 1400];
-
-// ─── Progress bar % after each step ───────────────────
 const PROGRESS = [20, 40, 60, 80, 100];
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-
-// ──────────────────────────────────────────────────────
 
 export default function Deploying({ setScreen, repo, setLiveUrl }) {
   const [activeStep, setActiveStep] = useState(-1);
@@ -38,55 +21,147 @@ export default function Deploying({ setScreen, repo, setLiveUrl }) {
   const [progress,   setProgress]   = useState(0);
   const [logs,       setLogs]       = useState([]);
 
-  // Prevents double-run in React Strict Mode (dev only)
-  const ran = useRef(false);
+  const ran         = useRef(false);
+  const instanceRef = useRef(null);
+  const pollRef     = useRef(null);
 
   useEffect(() => {
     if (ran.current) return;
     ran.current = true;
     runDeployment();
+
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, []);
 
-async function runDeployment() {
-  try {
-    // STEP 1: Call API
-    const res = await fetch("https://li1wxr5yvh.execute-api.eu-north-1.amazonaws.com/dev/deploy", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        repoUrl: `https://github.com/${repo}`
-      })
-    });
+  async function runDeployment() {
+    try {
+      // STEP 1 — Call deploy API
+      setActiveStep(0);
+      setProgress(20);
+      addLog("$ POST /deploy  { repoUrl: \"https://github.com/" + repo + "\" }", "info");
 
-    const data = await res.json();
+      const res = await fetch(import.meta.env.VITE_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoUrl: `https://github.com/${repo}` })
+      });
 
-    // STEP 2: show logs (fake UI continue)
-    const stepLogs = getStepLogs(repo);
+      const data = await res.json();
 
-    for (let i = 0; i < STEPS.length; i++) {
-      setActiveStep(i);
-      setProgress(PROGRESS[i]);
+      if (!res.ok || data.error) {
+        addLog("  Error: " + (data.error || "Deployment failed"), "error");
+        setScreen("error");
+        return;
+      }
 
-      setLogs(prev => [...prev, { text: "$ " + stepLogs[i][0], cls: "info" }]);
+      instanceRef.current = data.instanceId;
+      addLog("  Instance launched: " + data.instanceId + " ✓", "ok");
+      setDoneSteps([0]);
 
-      await wait(DELAYS[i]);
+      // STEP 2 — Instance launching
+      setActiveStep(1);
+      setProgress(40);
+      addLog("$ aws ec2 run-instances --instance-type t3.micro", "info");
+      await wait(2000);
+      addLog("  Public IP assigned ✓", "ok");
+      setDoneSteps(prev => [...prev, 1]);
 
-      setLogs(prev => [...prev, { text: "  " + stepLogs[i][1], cls: "ok" }]);
+      // STEP 3, 4, 5 — Poll real logs
+      setActiveStep(2);
+      setProgress(60);
+      addLog("$ Waiting for EC2 to initialize...", "info");
 
-      setDoneSteps(prev => [...prev, i]);
+      startLogPolling(data.instanceId, data.url);
+
+    } catch (err) {
+      console.error(err);
+      addLog("  Fatal error: " + err.message, "error");
+      setScreen("error");
     }
-
-    // STEP 3: use REAL URL from backend
-    setLiveUrl(data.url);
-    setScreen("success");
-
-  } catch (err) {
-    console.error(err);
-    setScreen("error");
   }
-}
+
+  function addLog(text, cls = "") {
+    setLogs(prev => [...prev, { text, cls }]);
+  }
+
+  function startLogPolling(instanceId, liveUrl) {
+    let lastLogLength = 0;
+    let stepProgressed = false;
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(import.meta.env.VITE_LOGS_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ instanceId })
+        });
+
+        const data = await res.json();
+
+        // Show new log lines
+        const lines = (data.logs || "").split("\n").filter(l => l.trim());
+        const newLines = lines.slice(lastLogLength);
+        lastLogLength = lines.length;
+
+        newLines.forEach(line => {
+          if (line.startsWith("+")) return; // skip bash -x noise
+          const cls = line.includes("ERROR") || line.includes("FAILED") ? "error"
+                    : line.includes("SUCCESS") || line.includes("done") ? "ok"
+                    : "info";
+          addLog("  " + line, cls);
+        });
+
+        // Update steps based on log content
+        const allLogs = data.logs || "";
+
+        if (!stepProgressed && allLogs.includes("Cloning repo")) {
+          setActiveStep(2);
+          setProgress(60);
+          stepProgressed = true;
+        }
+        if (allLogs.includes("docker build")) {
+          setActiveStep(3);
+          setProgress(80);
+          setDoneSteps(prev => prev.includes(2) ? prev : [...prev, 2]);
+        }
+        if (allLogs.includes("docker run")) {
+          setActiveStep(4);
+          setProgress(90);
+          setDoneSteps(prev => prev.includes(3) ? prev : [...prev, 3]);
+        }
+
+        // Check status
+        if (data.status === "DEPLOY_SUCCESS") {
+          clearInterval(pollRef.current);
+          setDoneSteps([0, 1, 2, 3, 4]);
+          setProgress(100);
+          addLog("  App is live ✓", "ok");
+          await wait(800);
+          setLiveUrl(liveUrl);
+          setScreen("success");
+        }
+
+        if (
+          data.status === "CLONE_FAILED" ||
+          data.status === "BUILD_FAILED" ||
+          data.status === "CONTAINER_CRASHED" ||
+          data.status === "APP_NOT_RESPONDING" ||
+          data.status === "UNSUPPORTED_STACK" ||
+          data.status === "NO_ENTRY_POINT"
+        ) {
+          clearInterval(pollRef.current);
+          addLog("  Deploy failed: " + data.status, "error");
+          setScreen("error");
+        }
+
+      } catch (err) {
+        // SSM not ready yet — keep polling
+        addLog("  Waiting for instance...", "");
+      }
+    }, 3000);
+  }
 
   function getStepClass(i) {
     if (doneSteps.includes(i)) return "step-item done";
@@ -116,12 +191,10 @@ async function runDeployment() {
           <div className="repo-pill">{repo}</div>
         </div>
 
-        {/* Progress bar */}
         <div className="prog-wrap">
           <div className="prog-fill" style={{ width: `${progress}%` }} />
         </div>
 
-        {/* Step list */}
         <div className="step-list">
           {STEPS.map((label, i) => (
             <div key={i} className={getStepClass(i)}>
@@ -131,7 +204,6 @@ async function runDeployment() {
           ))}
         </div>
 
-        {/* Live log output */}
         <div className="log-box">
           {logs.map((line, i) => (
             <div key={i} className={`log-line ${line.cls}`}>
